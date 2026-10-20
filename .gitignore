@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.agents/
+.codex/
+skills-lock.json
+.goal-wait/
+*.log
+.env
+.env.*
+experiments/*results.json

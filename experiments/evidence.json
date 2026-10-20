@@ -1,0 +1,34 @@
+{
+  "date": "2026-10-20",
+  "scope": "Sanitized observations; raw local paths, thread identifiers and provider details omitted.",
+  "historical_protocol_probes": {
+    "codex_versions": ["0.162.1", "0.163.0"],
+    "queue_only": {"turns": 1, "final_goal": "paused", "artifact_created": false},
+    "resume_after_notification": {"turns": 2, "final_goal": "complete", "artifact": "PASS\n"},
+    "resume_during_notification": {"turns": 2, "final_goal": "complete", "artifact": "PASS\n"}
+  },
+  "historical_real_model_smoke": {
+    "codex_version": "0.163.0",
+    "model": "gpt-6.1-sol",
+    "external_wait_seconds": 2,
+    "model_turns_during_wait": 0,
+    "turns_after_completion": 2,
+    "goal_status_after_ack": "paused",
+    "explicit_automatic_resume": true,
+    "final_goal": "complete",
+    "artifact": "PASS\n",
+    "objective_and_created_at_preserved": true
+  },
+  "implementation_regression": {
+    "command": "node tests/integration.mjs",
+    "codex_versions_passed": ["0.162.1", "0.163.0"],
+    "unit_tests_passed": 7,
+    "model": "local deterministic Responses fixture",
+    "scenarios": ["success", "failure", "fast", "spawn_error", "watch_preexisting", "watch_rename", "watch_invalid", "cancel", "terminate", "changed", "manual_pause", "disconnect"],
+    "no_model_polling_during_pending_job": true,
+    "one_ack_then_automatic_continuation_for_resumable_jobs": true,
+    "objective_created_at_and_budget_preserved": true,
+    "cancelled_changed_and_disconnected_jobs_not_resumed": true
+  },
+  "not_validated": ["20-minute-or-longer soak", "automatic recovery after app-server/helper/host restart", "atomic cancellation against simultaneous or no-op UI mutations"]
+}

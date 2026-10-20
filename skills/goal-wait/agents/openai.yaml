@@ -1,0 +1,4 @@
+interface:
+  display_name: "Goal Wait"
+  short_description: "Resume long-running Codex goals from completion events"
+  default_prompt: "Use $goal-wait to pause this goal during an authorized job expected to take over 20 minutes and automatically resume it when the job finishes."
