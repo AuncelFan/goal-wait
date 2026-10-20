@@ -35,6 +35,7 @@ function waitFor(predicate, label, timeout=12000) {
     },timeout);
     function check() {
       try {
+        if (current?.error) throw current.error;
         const result = predicate();
         if (result) {clearTimeout(timer);signals.off('change',check);resolve(result);}
       } catch (error) {clearTimeout(timer);signals.off('change',check);reject(error);}
@@ -97,7 +98,15 @@ const mock=http.createServer(async(req,res)=>{
       assert(JSON.stringify(request.input).includes('GOAL_WAIT_DONE'));
       response(res,message('GOAL_WAIT_ACK',index),index);
     } else if(!fs.existsSync(fixture.artifact)) {
+      if(fixture.execRequested) {
+        const output=request.input.filter(x=>x.type==='function_call_output').at(-1)?.output;
+        fixture.error=new Error(`Fixture command did not create the artifact: ${JSON.stringify(output)}`);
+        response(res,message('Fixture command failed; inspect its tool output.',index),index);
+        signals.emit('change');
+        return;
+      }
       assert(request.tools.some(x=>x.name==='exec_command'));
+      fixture.execRequested=true;
       const py=`import json,pathlib; r=json.loads(pathlib.Path(${JSON.stringify(path.join(fixture.jobDir,'result.json'))}).read_text()); pathlib.Path('resumed.txt').write_text(json.dumps(r['exit_code'])+'\\n')`;
       const quoted="'"+py.replaceAll("'","'\\''")+"'";
       response(res,call('exec_command',{cmd:`python3 -c ${quoted}`,workdir:fixture.directory,login:false,max_output_tokens:1000},index),index);

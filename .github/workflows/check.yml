@@ -7,6 +7,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         codex: ["0.162.1", "0.163.0"]
     steps:
@@ -17,6 +18,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      - name: Install Linux sandbox prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap apparmor-profiles apparmor-utils
+          if [ ! -f /etc/apparmor.d/bwrap-userns-restrict ] && [ -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict ]; then
+            sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+          fi
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          fi
+          bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- /bin/true
       - run: npm install --global @openai/codex@${{ matrix.codex }}
       - run: python3 -m unittest discover -s tests -v
       - run: node tests/integration.mjs
