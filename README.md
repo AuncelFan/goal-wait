@@ -14,13 +14,13 @@ helper 是普通 Python 后台程序，无第三方依赖，不是另一个 AI�
 npx skills add . --skill goal-wait --agent codex -y
 ```
 
-Git 仓库发布到 GitHub 后，也可以直接安装：
+从 GitHub 直接安装：
 
 ```bash
 npx skills add AuncelFan/goal-wait --skill goal-wait --agent codex -g -y
 ```
 
-远程命令依赖该 GitHub 仓库已发布；本地安装无需发布。安装只复制 skill，不安装服务、不改 Codex 配置，也不自动添加长期授权。
+仓库地址：[AuncelFan/goal-wait](https://github.com/AuncelFan/goal-wait)。安装只复制 skill，不安装服务、不改 Codex 配置，也不自动添加长期授权。
 
 ## 使用
 
