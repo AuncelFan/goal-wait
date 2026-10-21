@@ -94,7 +94,15 @@ const mock=http.createServer(async(req,res)=>{
       await fixture.releaseInitial;
       response(res,message('SETUP_DONE',index),index);
     } else if(index===2) {
+      if(fixture.mode==='progress_reauthorize') {
+        assert(JSON.stringify(request.input).includes('Is the existing task still running?'));
+        response(res,message('The same authorized task is still running.',index),index);
+        return;
+      }
       // Match real helper notification, not merely a hand-coded probe message.
+      assert(JSON.stringify(request.input).includes('GOAL_WAIT_DONE'));
+      response(res,message('GOAL_WAIT_ACK',index),index);
+    } else if(index===3 && fixture.mode==='progress_reauthorize') {
       assert(JSON.stringify(request.input).includes('GOAL_WAIT_DONE'));
       response(res,message('GOAL_WAIT_ACK',index),index);
     } else if(!fs.existsSync(fixture.artifact)) {
@@ -171,16 +179,53 @@ async function scenario(mode) {
       }
       if(mode==='cancel' || mode==='terminate') await run(['cancel',fixture.jobId,'--state-dir',stateRoot,...(mode==='terminate'?['--terminate']:[])]);
       if(mode==='changed') await rpc('thread/goal/set',{threadId,objective:'A new user objective must not be resumed by the old helper',status:'paused',origin:'user'});
-      if(mode==='manual_pause') await rpc('thread/goal/set',{threadId,status:'paused',origin:'user'});
+      if(mode==='identical_pause_payload') {
+        const prior=events.slice(offset).filter(e=>e.method==='thread/goal/updated' && e.params.goal?.status==='paused').at(-1);
+        const before=events.length;
+        await rpc('thread/resume',{threadId});
+        await waitFor(()=>events.slice(before).some(e=>e.method==='thread/goal/updated' && e.params.goal?.status==='paused'),
+          're-subscription paused snapshot');
+        const resubscribed=events.slice(before).find(e=>e.method==='thread/goal/updated' && e.params.goal?.status==='paused');
+        assert.deepEqual(resubscribed.params.goal,prior.params.goal,
+          'Re-subscribing emits the same paused goal snapshot');
+        const afterResubscribe=events.length;
+        await rpc('thread/goal/set',{threadId,status:'paused',origin:'user'});
+        await new Promise(resolve=>setTimeout(resolve,100));
+        const repeated=events.slice(afterResubscribe).find(e=>e.method==='thread/goal/updated' && e.params.goal?.status==='paused');
+        assert(prior && repeated, 'Expected to observe both helper pause and identical paused update');
+        assert.deepEqual(repeated.params.goal,prior.params.goal,
+          'The app-server exposes a same-value pause with the same payload as a goal snapshot');
+        assert.equal(repeated.params.turnId,null);
+      }
       fixture.release();
       await waitFor(()=>events.slice(offset).some(e=>e.method==='turn/completed' && e.params.threadId===threadId),'initial turn end');
+      if(mode==='progress_reauthorize') {
+        const progressMessageId=randomUUID();
+        await rpc('thread/queue/add',{threadId,clientUserMessageId:progressMessageId,
+          input:[{type:'text',text:'Is the existing task still running?'}]});
+        await waitFor(()=>JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'state.json'))).wake_suppressed==='new_user_input',
+          'progress question suppresses the old helper');
+        await waitFor(()=>events.slice(offset).filter(e=>e.method==='turn/completed' && e.params.threadId===threadId).length===2,
+          'progress reply turn end');
+        const before=JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'state.json')));
+        assert.equal(before.phase,'suppressed');
+        assert.equal(before.child_pid,fixture.childPid,'Reauthorization keeps the original business process');
+        const firstSuppression=JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'suppression.json')));
+        assert.equal(firstSuppression.reason_code,'new_user_input');
+        await run(['reauthorize',fixture.jobId,'--state-dir',stateRoot,'--authorize-auto-pause-resume']);
+        await waitFor(()=>['waiting','result_ready'].includes(
+          JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'state.json'))).phase),
+          'same helper reauthorized');
+        assert.equal(JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'state.json'))).helper_pid,ready.helper_pid);
+        assert.equal(JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'state.json'))).child_pid,fixture.childPid);
+      }
       if(mode==='disconnect') {
         process.kill(-server.pid,'SIGKILL');await once(server,'exit');server=null;
       }
       // A short negative observation window; no model-driven polling.
       if(fixture.childPid && mode!=='terminate') {
         await new Promise(resolve=>setTimeout(resolve,120));
-        assert.equal(fixture.requests,1,'Model was polled while the job was pending');
+        assert.equal(fixture.requests,mode==='progress_reauthorize'?2:1,'Model was polled while the job was pending');
         process.kill(fixture.childPid,'SIGUSR1');
       }
       if(fileMode && mode!=='watch_preexisting') {
@@ -188,15 +233,20 @@ async function scenario(mode) {
         fs.renameSync(done+'.tmp',done);
       }
       await waitFor(()=>fs.existsSync(path.join(fixture.jobDir,'result.json')),'persisted result');
-      const suppressed=['cancel','terminate','changed','manual_pause','disconnect'].includes(mode);
+      const suppressed=['cancel','terminate','changed','disconnect'].includes(mode);
       if(suppressed) {
         await waitFor(()=>JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'state.json'))).phase==='suppressed','suppressed wake');
+        const suppression=JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'suppression.json')));
+        assert(suppression.reason_code);
+        assert.equal(suppression.notification_attempted,false);
         await new Promise(resolve=>setTimeout(resolve,120));
         assert.equal(fixture.requests,1,'Cancelled/changed/disconnected job woke the model');
         assert(!fs.existsSync(fixture.artifact));
       } else {
         await waitFor(()=>events.slice(offset).some(e=>e.method==='thread/goal/updated' && e.params.threadId===threadId && e.params.goal.status==='complete'),'automatic goal completion');
-        await waitFor(()=>events.slice(offset).filter(e=>e.method==='turn/completed' && e.params.threadId===threadId).length===3,'three completed turns');
+        const completedTurns=mode==='progress_reauthorize'?4:3;
+        await waitFor(()=>events.slice(offset).filter(e=>e.method==='turn/completed' && e.params.threadId===threadId).length===completedTurns,
+          'completion, ACK and continuation turns');
         const goal=(await rpc('thread/goal/get',{threadId})).goal;
         assert.equal(goal.objective,original.objective);
         assert.equal(goal.createdAt,original.createdAt);
@@ -206,10 +256,14 @@ async function scenario(mode) {
         assert.equal(fs.readFileSync(fixture.artifact,'utf8'),JSON.stringify(expected)+'\n');
         assert(fixture.completionRequested,'Completion must pass through the actual model tool path');
         const notices=events.slice(offset).filter(e=>e.method==='item/started' && e.params.item.type==='userMessage');
-        assert.equal(notices.length,1,'One completion notification only');
+        assert.equal(notices.length,mode==='progress_reauthorize'?2:1,'One completion notification only');
       }
       const state=JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'state.json')));
       const result=JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'result.json')));
+      if(mode==='cancel'||mode==='terminate') {
+        const suppression=JSON.parse(fs.readFileSync(path.join(fixture.jobDir,'suppression.json')));
+        assert.equal(suppression.reason_code,'cancelled_by_user');
+      }
       const summary={mode,phase:state.phase,exitCode:result.exit_code,requests:fixture.requests,
         turns:events.slice(offset).filter(e=>e.method==='turn/started'&&e.params.threadId===threadId).length};
       if(mode==='terminate') assert.equal(result.exit_code,-15);
@@ -246,7 +300,9 @@ try {
   });
   const info=await rpc('initialize',{clientInfo:{name:'goal_wait_integration',version:'0.1.0'},capabilities:{experimentalApi:true}});
   ws.send(JSON.stringify({method:'initialized',params:{}}));
-  for(const mode of ['success','failure','fast','spawn_error','watch_preexisting','watch_rename','watch_invalid','cancel','terminate','changed','manual_pause','disconnect']) await scenario(mode);
+  for(const mode of ['success','failure','fast','spawn_error','watch_preexisting','watch_rename','watch_invalid',
+    'progress_reauthorize',
+    'cancel','terminate','changed','identical_pause_payload','disconnect']) await scenario(mode);
   console.log(JSON.stringify({validated:true,server:info.userAgent,scenarios:summaries.length}));
 } catch(error) {
   console.error(error.stack);console.error(serverErrors.slice(-2500));

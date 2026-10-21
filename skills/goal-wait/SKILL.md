@@ -26,4 +26,15 @@ Read [the workflow](references/workflow.md) for setup, external completion files
 4. On `GOAL_WAIT_DONE`, this is the **notification ACK turn**. Reply `GOAL_WAIT_ACK` and end the turn. The helper waits for that specific turn to finish, checks ownership, then restores the same goal to active. Do not change goal state during this ACK turn.
 5. In the subsequent automatic goal turn, read the persisted `result.json` and logs, check the actual exit code and artifacts, then continue the original work. A notification also fires on failure; it does not mean the job succeeded.
 
+If the user asks only for progress while waiting, answer from the existing job state,
+then check the original authorization, goal identity, and whether the existing task
+is still running or has a result. If the user has not asked to stop, cancel, or change
+the goal and the prior authorization still applies, reauthorize the **same live
+helper** after the progress turn ends; do not start the business command again. For
+example, use `status JOB_ID`, then `reauthorize JOB_ID --authorize-auto-pause-resume`
+only when status says the helper is alive and its suppression reason is
+`new_user_input`. If the helper has exited, inspect the result and follow the manual
+recovery steps instead of recreating the job. Explicit stop, cancel, or goal changes
+always take precedence.
+
 The helper blocks on ordinary OS events while the model is idle. `status` is for user-requested diagnosis, not periodic checks. `cancel JOB_ID` revokes this helper's automatic wake; `cancel JOB_ID --terminate` also sends SIGTERM to its command process group. Cancel before manually changing the goal when possible. On disconnect, lost helper, or ambiguous state, preserve the result and use the manual recovery procedure; v1 does not automatically restore ownership across restarts.

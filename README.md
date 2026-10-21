@@ -60,6 +60,7 @@ python3 skills/goal-wait/scripts/goal_wait.py doctor --thread "$CODEX_THREAD_ID"
 python3 skills/goal-wait/scripts/goal_wait.py status JOB_UUID
 python3 skills/goal-wait/scripts/goal_wait.py cancel JOB_UUID
 python3 skills/goal-wait/scripts/goal_wait.py cancel JOB_UUID --terminate
+python3 skills/goal-wait/scripts/goal_wait.py reauthorize JOB_UUID --authorize-auto-pause-resume
 python3 skills/goal-wait/scripts/goal_wait.py reconcile JOB_UUID
 ```
 
@@ -71,7 +72,7 @@ python3 skills/goal-wait/scripts/goal_wait.py reconcile JOB_UUID
 
 首版要求本地 Linux/WSL、helper 和原 app-server 持续运行。断连、重启或丢失目标所有权时保留结果，停止自动恢复，交由用户决定；不提供重启后自动恢复。API 没有条件更新/所有权锁，无法保证识别每种并发或无变化的 UI 暂停；使用 `cancel JOB_UUID` 可明确撤销。没有自动创建 goal、hook 轮询或桌面操作。
 
-之前已用真实模型验证完整通知和恢复链路。新 helper 在 0.162.1、0.163.0 上各通过 12 个集成场景，另有 7 个单元测试通过；回归使用隔离 Codex 配置和本地模拟模型，不消耗真实模型额度。尚未进行超过 20 分钟的稳定性长测。
+之前已用真实模型验证完整通知和恢复链路。当前回归在 Codex 0.163.0 隔离 app-server 上通过 13 个集成场景，另有 12 个单元测试；包含重复 paused 快照、同值显式 pause 的协议限制、进度问答后重新授权同一 helper、明确取消和诊断持久化。测试使用隔离 Codex 配置和本地模拟模型，不消耗真实模型额度。尚未进行超过 20 分钟的稳定性长测。
 
 ```bash
 python3 -m unittest discover -s tests -v

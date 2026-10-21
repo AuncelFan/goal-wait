@@ -44,3 +44,4 @@ lifecycle.jsonl
 *.pid
 *.sock
 *.socket
+GOAL_WAIT_MAINTAINER_REPORT_*.md

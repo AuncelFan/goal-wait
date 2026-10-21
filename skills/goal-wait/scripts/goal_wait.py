@@ -3,6 +3,7 @@
 
 import argparse
 import ctypes
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -103,6 +104,9 @@ class Worker:
         self.active = set()
         self.pause_notice_pending = False
         self.suppressed = None
+        self.suppression = None
+        self.reauthorization_deadline = None
+        self.superseding_turn = None
         self.result = None
         self.child = None
         self.job_thread = None
@@ -128,10 +132,53 @@ class Worker:
                 # A timed-out launcher must not kill a job that already started.
                 print("Launcher disconnected; inspect persisted state before retrying", file=sys.stderr)
 
-    def suppress(self, reason):
-        if not self.suppressed:
-            self.suppressed = reason
-            self.save(phase="suppressed", wake_suppressed=reason)
+    @staticmethod
+    def goal_summary(goal):
+        if not isinstance(goal, dict):
+            return None
+        return {
+            "thread_id": goal.get("threadId"),
+            "created_at": goal.get("createdAt"),
+            "token_budget": goal.get("tokenBudget"),
+            "status": goal.get("status"),
+            "updated_at": goal.get("updatedAt"),
+        }
+
+    def suppress(self, reason, message=None, observed_goal=None, changed_fields=None):
+        if self.suppressed == reason and self.state.get("phase") == "suppressed":
+            return
+        first_suppression = self.suppressed is None
+        if first_suppression:
+            params = message.get("params", {}) if isinstance(message, dict) else {}
+            original = self.state.get("original_goal")
+            paused = self.state.get("paused_goal")
+            if changed_fields is None and isinstance(observed_goal, dict) and isinstance(paused, dict):
+                changed_fields = [key for key in (
+                    "threadId", "createdAt", "objective", "tokenBudget", "status")
+                    if observed_goal.get(key) != paused.get(key)]
+            self.suppression = {
+                "suppressed_at": datetime.now(timezone.utc).isoformat(),
+                "reason_code": reason,
+                "triggering_method": message.get("method") if isinstance(message, dict) else None,
+                "triggering_turn_id": params.get("turnId") or params.get("turn_id"),
+                "triggering_client_id": params.get("clientId") or params.get("client_id"),
+                "triggering_event_id": params.get("eventId") or params.get("event_id"),
+                "original_goal": self.goal_summary(original),
+                "paused_goal": self.goal_summary(paused),
+                "observed_goal": self.goal_summary(observed_goal),
+                "changed_fields": sorted(set(changed_fields or [])),
+                "pause_notice_pending": self.pause_notice_pending,
+                "notification_attempted": bool(self.state.get("notification_attempted")),
+                "notification_queued": bool(self.state.get("notification_queued")),
+            }
+            suppression_path = self.directory / "suppression.json"
+            if not suppression_path.exists():
+                atomic_json(suppression_path, self.suppression)
+            self.state["suppression_file"] = str(suppression_path)
+        # Keep the first trigger record immutable, while status reports the latest
+        # reason automatic recovery remains revoked (for example, a later cancel).
+        self.suppressed = reason
+        self.save(phase="suppressed", wake_suppressed=reason)
 
     def goal(self):
         return self.client.call("thread/goal/get", {"threadId": self.state["thread_id"]}).get("goal")
@@ -139,19 +186,38 @@ class Worker:
     def check_goal(self):
         current = self.goal()
         if not same_goal(current, self.state["paused_goal"]) or current.get("status") != "paused":
-            self.suppress("Original paused goal changed or is no longer resumable")
+            self.suppress("goal_changed", {"method": "thread/goal/get"}, observed_goal=current)
         return not self.suppressed
 
     def event(self, message):
         method, params = message.get("method"), message.get("params", {})
         if method == "_cancel":
-            self.suppress("Cancelled by user")
+            self.suppress("cancelled_by_user", message)
             if (self.directory / "cancel.json").exists() and read_json(self.directory / "cancel.json").get("terminate"):
                 if self.child and self.child.poll() is None:
                     os.killpg(self.child.pid, signal.SIGTERM)
             return
+        if method == "_reauthorize":
+            if self.suppressed != "new_user_input":
+                return
+            if (self.directory / "cancel.json").exists() or self.active - {self.superseding_turn}:
+                self.suppressed = "reauthorization_rejected"
+                self.save(phase="suppressed", wake_suppressed=self.suppressed,
+                          reauthorization_error_code="cancelled_or_turn_active")
+                return
+            current = self.goal()
+            if not same_goal(current, self.state.get("paused_goal")) or current.get("status") != "paused":
+                self.suppressed = "reauthorization_rejected"
+                self.save(phase="suppressed", wake_suppressed=self.suppressed,
+                          reauthorization_error_code="goal_changed")
+                return
+            self.suppressed = None
+            self.reauthorization_deadline = None
+            self.save(phase="result_ready" if self.result is not None else "waiting",
+                      wake_suppressed=None, reauthorized_at=time.time())
+            return
         if method == "_disconnected":
-            self.suppress("App-server disconnected; automatic recovery requires a new authorization")
+            self.suppress("app_server_disconnected", message)
             return
         if method == "_result":
             self.result = params
@@ -166,10 +232,11 @@ class Worker:
         if params.get("threadId") != self.state["thread_id"]:
             return
         if method in ("thread/goal/cleared", "thread/archived", "thread/closed", "thread/deleted"):
-            self.suppress(method)
+            self.suppress(method.replace("thread/", "").replace("/", "_"), message)
         elif method == "thread/goal/updated":
             goal = params.get("goal")
-            if self.pause_notice_pending and goal == self.state["paused_goal"]:
+            if (self.pause_notice_pending and same_goal(goal, self.state["paused_goal"])
+                    and goal.get("status") == "paused"):
                 self.pause_notice_pending = False
             elif (self.pause_notice_pending and same_goal(goal, self.state["original_goal"])
                   and goal.get("status") == "active"):
@@ -177,10 +244,10 @@ class Worker:
                 # received after the next RPC; it precedes our own pause event.
                 return
             elif not same_goal(goal, self.state["paused_goal"]) or goal.get("status") != "paused":
-                self.save(conflicting_goal_event=params)
-                self.suppress("Goal modified while waiting")
-            elif params.get("turnId") is None:
-                self.suppress("A new explicit goal mutation superseded the helper pause")
+                self.suppress("goal_modified", message, observed_goal=goal)
+            # Once our pause is confirmed, identical paused goal payloads are
+            # idempotent snapshots. The protocol has no source/revision field
+            # that can distinguish these from an explicit no-op pause.
         elif method == "turn/started":
             self.active.add(params["turn"]["id"])
         elif method in ("item/started", "item/completed"):
@@ -190,7 +257,10 @@ class Worker:
                     self.notice_turn = params["turnId"]
                     self.save(notification_turn=self.notice_turn)
                 else:
-                    self.suppress("New user input superseded automatic waiting")
+                    self.superseding_turn = params.get("turnId")
+                    diagnostic_message = {"method": method, "params": {
+                        **params, "clientId": item.get("clientId")}}
+                    self.suppress("new_user_input", diagnostic_message)
         elif method == "turn/completed":
             turn = params["turn"]
             self.active.discard(turn["id"])
@@ -198,7 +268,9 @@ class Worker:
                 if turn.get("status") == "completed":
                     self.acknowledged = True
                 else:
-                    self.suppress("Notification turn failed or was interrupted")
+                    diagnostic_message = {"method": method, "params": {
+                        **params, "turn_id": turn.get("id")}}
+                    self.suppress("notification_turn_failed", diagnostic_message)
 
     def drain(self):
         while True:
@@ -238,6 +310,7 @@ class Worker:
         os.umask(0o077)
         self.save(helper_pid=os.getpid(), helper_identity=proc_identity(os.getpid()))
         signal.signal(signal.SIGUSR1, lambda *_: self.events.put({"method": "_cancel"}))
+        signal.signal(signal.SIGUSR2, lambda *_: self.events.put({"method": "_reauthorize"}))
         # Never kill the user's daemon. Keep this one subscription until delivery.
         self.client = Client(self.state["endpoint"], self.events)
         thread_id = self.state["thread_id"]
@@ -267,7 +340,18 @@ class Worker:
             self.drain()
             if self.result is not None:
                 if self.suppressed:
-                    return
+                    if self.suppressed != "new_user_input":
+                        return
+                    if self.reauthorization_deadline is None:
+                        self.reauthorization_deadline = time.monotonic() + self.state["ack_timeout_seconds"]
+                    remaining = self.reauthorization_deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    try:
+                        self.event(self.events.get(timeout=remaining))
+                    except queue.Empty:
+                        return
+                    continue
                 if not self.active and not self.state.get("notification_queued"):
                     if not self.check_goal():
                         continue
@@ -304,7 +388,7 @@ class Worker:
                     return
             remaining = None if self.ack_deadline is None else self.ack_deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
-                self.suppress("Notification turn timed out; inspect state before manual recovery")
+                self.suppress("notification_turn_timeout", {"method": "local_timeout"})
                 continue
             try:
                 event = self.events.get(timeout=remaining)
@@ -394,11 +478,27 @@ def inspect_job(args):
                 os.kill(pid, signal.SIGUSR1)
             except ProcessLookupError:
                 pass
+    if args.action == "reauthorize":
+        if not args.authorize_auto_pause_resume:
+            raise ValueError("Reauthorization requires fresh explicit user authorization")
+        if not alive:
+            raise ValueError("Helper is no longer running; inspect the result and recover manually without restarting the job")
+        if state.get("phase") != "suppressed" or state.get("wake_suppressed") != "new_user_input":
+            raise ValueError("Only a helper suppressed by new user input can be reauthorized")
+        if (directory / "cancel.json").exists():
+            raise ValueError("This job was explicitly cancelled and cannot be reauthorized")
+        try:
+            os.kill(pid, signal.SIGUSR2)
+        except ProcessLookupError as error:
+            raise ValueError("Helper exited before reauthorization; inspect the result and recover manually") from error
     if args.action == "reconcile" and not alive and state["phase"] not in TERMINAL:
         state.update(phase="orphaned", recovery="Inspect result/logs; no automatic resume after lost ownership")
         atomic_json(directory / "state.json", state)
     result_path = directory / "result.json"
+    suppression_path = directory / "suppression.json"
     print(json.dumps({"job_dir": str(directory), "helper_alive": alive, "state": state,
+                      "automatic_resume": "suppressed" if state["phase"] == "suppressed" else state["phase"],
+                      "suppression": read_json(suppression_path) if suppression_path.exists() else None,
                       "cancel_requested": (directory / "cancel.json").exists(),
                       "result": read_json(result_path) if result_path.exists() else None}, ensure_ascii=False, indent=2))
 
@@ -422,12 +522,14 @@ def main():
         item.add_argument("--job-id")
         item.add_argument("--ack-timeout-seconds", type=int, default=600)
         item.add_argument("command", nargs=argparse.REMAINDER)
-    for action in ("status", "cancel", "reconcile"):
+    for action in ("status", "cancel", "reauthorize", "reconcile"):
         item = sub.add_parser(action)
         item.add_argument("job_id")
         item.add_argument("--state-dir", default=state_default())
         if action == "cancel":
             item.add_argument("--terminate", action="store_true", help="Also SIGTERM the command process group")
+        if action == "reauthorize":
+            item.add_argument("--authorize-auto-pause-resume", action="store_true")
     worker = sub.add_parser("_worker", help=argparse.SUPPRESS)
     worker.add_argument("directory")
     worker.add_argument("ready_fd", type=int)
@@ -445,7 +547,7 @@ def main():
                 instance.ready(str(error))
                 # Keep collecting the result even if wake delivery failed. Never rerun it.
                 if instance.job_thread is not None:
-                    instance.suppress(str(error))
+                    instance.suppress("worker_error", {"method": "_worker_exception"})
                     instance.job_thread.join()
                     instance.drain()
                 return 1

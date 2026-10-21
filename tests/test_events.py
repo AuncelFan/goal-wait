@@ -18,24 +18,133 @@ from goal_wait import CompletionWatch, Worker, atomic_json
 
 
 class EventsTest(unittest.TestCase):
-    def test_subscription_snapshot_is_distinct_from_later_user_mutation(self):
+    def test_repeated_paused_snapshots_are_idempotent_until_goal_really_changes(self):
         with tempfile.TemporaryDirectory() as root:
-            goal = {"threadId": "fixture", "createdAt": 1, "objective": "Continue", "status": "active"}
-            paused = dict(goal, status="paused")
+            goal = {"threadId": "fixture", "createdAt": 1, "objective": "Continue",
+                    "tokenBudget": 500, "status": "active", "tokensUsed": 10,
+                    "timeUsedSeconds": 4, "updatedAt": 1}
+            paused = dict(goal, status="paused", updatedAt=2)
             atomic_json(Path(root) / "state.json", {
                 "job_id": "fixture", "thread_id": "fixture", "original_goal": goal, "paused_goal": paused})
             worker = Worker(root, None)
             worker.pause_notice_pending = True
 
-            def event(value):
+            def event(value, turn_id=None):
                 worker.event({"method": "thread/goal/updated", "params": {
-                    "threadId": "fixture", "turnId": None, "goal": value}})
+                    "threadId": "fixture", "turnId": turn_id, "goal": value}})
 
-            event(goal)  # Subscription snapshot from before helper's pause.
-            event(paused)  # The actual helper pause notification.
+            event(goal, "subscription-turn")  # Snapshot from before helper's pause.
+            event(paused, "pause-turn")  # The actual helper pause notification.
             self.assertIsNone(worker.suppressed)
-            event(goal)  # A user resume after helper pause must revoke ownership.
+            self.assertFalse(worker.pause_notice_pending)
+
+            # Re-subscription and accounting updates can emit the same paused goal
+            # with turnId=null; neither proves that a user revoked ownership.
+            snapshot = dict(paused, tokensUsed=15, timeUsedSeconds=7)
+            event(snapshot)
+            event(dict(snapshot))
+            self.assertIsNone(worker.suppressed)
+
+            event(dict(paused, objective="A different goal"))
             self.assertIsNotNone(worker.suppressed)
+            record = json.loads((Path(root) / "suppression.json").read_text())
+            self.assertEqual(record["reason_code"], "goal_modified")
+            self.assertEqual(record["triggering_method"], "thread/goal/updated")
+            self.assertEqual(record["triggering_turn_id"], None)
+            self.assertEqual(record["changed_fields"], ["objective"])
+            self.assertNotIn("objective", record["observed_goal"])
+            self.assertEqual(record["notification_attempted"], False)
+
+            # Later result persistence must not overwrite first suppression evidence.
+            first_record = (Path(root) / "suppression.json").read_text()
+            worker.event({"method": "_result", "params": {"exit_code": 0}})
+            self.assertEqual((Path(root) / "suppression.json").read_text(), first_record)
+            self.assertEqual(json.loads((Path(root) / "state.json").read_text())["phase"], "suppressed")
+
+    def test_explicit_cancel_has_a_diagnostic_record(self):
+        with tempfile.TemporaryDirectory() as root:
+            atomic_json(Path(root) / "state.json", {
+                "job_id": "fixture", "thread_id": "fixture",
+                "event_id": "wake-client",
+                "original_goal": {"threadId": "fixture", "createdAt": 1,
+                                  "objective": "Continue", "status": "active"},
+                "paused_goal": {"threadId": "fixture", "createdAt": 1,
+                                "objective": "Continue", "status": "paused"}})
+            worker = Worker(root, None)
+            worker.event({"method": "_cancel", "params": {"clientId": "test-client"}})
+            record = json.loads((Path(root) / "suppression.json").read_text())
+            self.assertEqual(record["reason_code"], "cancelled_by_user")
+            self.assertEqual(record["triggering_method"], "_cancel")
+            self.assertEqual(record["triggering_client_id"], "test-client")
+            self.assertFalse(record["notification_queued"])
+
+    def test_later_cancel_updates_status_but_preserves_first_trigger(self):
+        with tempfile.TemporaryDirectory() as root:
+            atomic_json(Path(root) / "state.json", {
+                "job_id": "fixture", "thread_id": "fixture",
+                "event_id": "wake-client",
+                "original_goal": {"threadId": "fixture", "createdAt": 1,
+                                  "objective": "Continue", "status": "active"},
+                "paused_goal": {"threadId": "fixture", "createdAt": 1,
+                                "objective": "Continue", "status": "paused"}})
+            worker = Worker(root, None)
+            worker.event({"method": "item/started", "params": {
+                "threadId": "fixture", "turnId": "progress-turn",
+                "item": {"type": "userMessage", "clientId": "progress-client"}}})
+            first_record = (Path(root) / "suppression.json").read_text()
+            worker.event({"method": "_cancel"})
+            record = json.loads((Path(root) / "suppression.json").read_text())
+            state = json.loads((Path(root) / "state.json").read_text())
+            self.assertEqual(record["reason_code"], "new_user_input")
+            self.assertEqual(state["wake_suppressed"], "cancelled_by_user")
+            self.assertEqual((Path(root) / "suppression.json").read_text(), first_record)
+
+    def test_same_value_pause_payload_is_indistinguishable_and_not_inferred_as_cancel(self):
+        with tempfile.TemporaryDirectory() as root:
+            paused = {"threadId": "fixture", "createdAt": 1, "objective": "Continue",
+                      "tokenBudget": None, "status": "paused", "updatedAt": 2}
+            atomic_json(Path(root) / "state.json", {
+                "job_id": "fixture", "thread_id": "fixture", "paused_goal": paused,
+                "original_goal": dict(paused, status="active")})
+            worker = Worker(root, None)
+            worker.pause_notice_pending = True
+            worker.event({"method": "thread/goal/updated", "params": {
+                "threadId": "fixture", "turnId": None, "goal": dict(paused)}})
+            worker.event({"method": "thread/goal/updated", "params": {
+                "threadId": "fixture", "turnId": None, "goal": dict(paused)}})
+            self.assertIsNone(worker.suppressed)
+            self.assertFalse((Path(root) / "suppression.json").exists())
+
+    def test_identity_budget_and_status_changes_revoke_old_waiter(self):
+        base = {"threadId": "fixture", "createdAt": 1, "objective": "Continue",
+                "tokenBudget": 500, "status": "paused", "updatedAt": 2}
+        changes = {
+            "createdAt": dict(base, createdAt=2),
+            "objective": dict(base, objective="Different objective"),
+            "tokenBudget": dict(base, tokenBudget=900),
+            "status": dict(base, status="active"),
+        }
+        for changed_field, observed in changes.items():
+            with self.subTest(changed_field=changed_field), tempfile.TemporaryDirectory() as root:
+                atomic_json(Path(root) / "state.json", {
+                    "job_id": "fixture", "thread_id": "fixture",
+                    "original_goal": dict(base, status="active"), "paused_goal": base})
+                worker = Worker(root, None)
+                worker.event({"method": "thread/goal/updated", "params": {
+                    "threadId": "fixture", "turnId": None, "goal": observed}})
+                self.assertEqual(worker.suppressed, "goal_modified")
+                record = json.loads((Path(root) / "suppression.json").read_text())
+                self.assertEqual(record["changed_fields"], [changed_field])
+
+    def test_clear_archive_and_close_events_revoke_old_waiter(self):
+        for method in ("thread/goal/cleared", "thread/archived", "thread/closed", "thread/deleted"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as root:
+                atomic_json(Path(root) / "state.json", {
+                    "job_id": "fixture", "thread_id": "fixture"})
+                worker = Worker(root, None)
+                worker.event({"method": method, "params": {"threadId": "fixture"}})
+                record = json.loads((Path(root) / "suppression.json").read_text())
+                self.assertEqual(record["reason_code"], method.replace("thread/", "").replace("/", "_"))
 
     def test_launcher_disconnect_does_not_abort_detached_worker(self):
         with tempfile.TemporaryDirectory() as root:
